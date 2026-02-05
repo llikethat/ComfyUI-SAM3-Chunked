@@ -246,13 +246,14 @@ class SAM3Propagate:
             )
 
     def _apply_initial_prompt(self, model, inf, prompt, device, dtype, orig_h, orig_w):
-        """Apply the user's prompt (box / text) to the SAM3 inference state."""
+        """Apply the user's prompt (box / point / text) to the SAM3 inference state."""
         ptype = prompt.get("type", "box")
         frame = prompt.get("frame", 0)
 
         pos = prompt.get("positive")
         neg = prompt.get("negative")
 
+        # ── Box prompts ──
         if ptype in ("box", "auto") and pos is not None:
             boxes = pos.get("boxes")
             if boxes is not None and len(boxes) > 0:
@@ -265,6 +266,37 @@ class SAM3Propagate:
                 except Exception:
                     pass  # fall through
 
+        # ── Point prompts ──
+        pos_pts = prompt.get("positive_points")
+        neg_pts = prompt.get("negative_points")
+
+        if ptype in ("point", "auto") and pos_pts is not None:
+            points_data = pos_pts.get("points")
+            if points_data is not None and len(points_data) > 0:
+                # Combine positive and negative points
+                all_points = [points_data]
+                all_labels = [torch.ones(len(points_data), dtype=torch.long)]
+
+                if neg_pts is not None:
+                    neg_data = neg_pts.get("points")
+                    if neg_data is not None and len(neg_data) > 0:
+                        all_points.append(neg_data)
+                        all_labels.append(torch.zeros(len(neg_data), dtype=torch.long))
+
+                combined_points = torch.cat(all_points, dim=0)
+                combined_labels = torch.cat(all_labels, dim=0)
+
+                try:
+                    model.add_new_points_or_box(
+                        inf, frame_idx=frame,
+                        points=combined_points.to(device),
+                        labels=combined_labels.to(device),
+                    )
+                    return
+                except Exception:
+                    pass  # fall through
+
+        # ── Text prompts ──
         text = prompt.get("text", "")
         if ptype in ("text", "auto") and text:
             try:
@@ -308,6 +340,7 @@ class SAM3Propagate:
                 ).squeeze()
         else:
             seed = None
+            # Try box prompts first
             pos = prompt.get("positive") if prompt else None
             if pos is not None:
                 boxes = pos.get("boxes")
@@ -316,6 +349,23 @@ class SAM3Propagate:
                     x1, y1, x2, y2 = int(b[0]), int(b[1]), int(b[2]), int(b[3])
                     seed = torch.zeros(orig_h, orig_w, dtype=torch.float32)
                     seed[max(0,y1):min(orig_h,y2), max(0,x1):min(orig_w,x2)] = 1.0
+
+            # Try point prompts if no box seed
+            if seed is None:
+                pos_pts = prompt.get("positive_points") if prompt else None
+                if pos_pts is not None:
+                    points = pos_pts.get("points")
+                    if points is not None and len(points) > 0:
+                        # Create a circular mask around each positive point
+                        seed = torch.zeros(orig_h, orig_w, dtype=torch.float32)
+                        radius = max(orig_h, orig_w) // 20  # 5% of image dimension
+                        for pt in points:
+                            px, py = int(pt[0].item()), int(pt[1].item())
+                            y_min = max(0, py - radius)
+                            y_max = min(orig_h, py + radius)
+                            x_min = max(0, px - radius)
+                            x_max = min(orig_w, px + radius)
+                            seed[y_min:y_max, x_min:x_max] = 1.0
 
             if seed is None:
                 seed = torch.zeros(orig_h, orig_w, dtype=torch.float32)

@@ -55,9 +55,13 @@ class SAM3VideoSegmentation:
                 }),
             },
             "optional": {
+                # ── prompt inputs (visibility managed by sam3_video_dynamic.js) ──
                 "positive_boxes": ("SAM3_BOXES_PROMPT", {"tooltip": "Positive box prompts"}),
                 "negative_boxes": ("SAM3_BOXES_PROMPT", {"tooltip": "Negative box prompts"}),
-                "prompt_type": (["box", "text", "auto"], {"default": "box"}),
+                "positive_points": ("SAM3_POINTS_PROMPT", {"tooltip": "Positive point prompts"}),
+                "negative_points": ("SAM3_POINTS_PROMPT", {"tooltip": "Negative point prompts"}),
+                # ── prompt mode widget (drives dynamic visibility in the JS) ──
+                "prompt_mode": (["box", "point", "text", "auto"], {"default": "box"}),
                 "text_prompt": ("STRING", {"default": "person", "tooltip": "Text prompt for segmentation"}),
                 "prompt_frame": ("INT", {"default": 0, "min": 0}),
                 # ── chunked-specific ──
@@ -82,7 +86,9 @@ class SAM3VideoSegmentation:
         video_frames,
         positive_boxes=None,
         negative_boxes=None,
-        prompt_type="box",
+        positive_points=None,
+        negative_points=None,
+        prompt_mode="box",
         text_prompt="person",
         prompt_frame=0,
         chunk_size=100,
@@ -112,11 +118,13 @@ class SAM3VideoSegmentation:
 
         # ── Build prompt data ────────────────────────────────
         prompt_data = {
-            "type": prompt_type,
+            "type": prompt_mode,
             "text": text_prompt,
             "frame": prompt_frame,
             "positive": positive_boxes,
             "negative": negative_boxes,
+            "positive_points": positive_points,
+            "negative_points": negative_points,
         }
 
         # ── Build video state ────────────────────────────────
