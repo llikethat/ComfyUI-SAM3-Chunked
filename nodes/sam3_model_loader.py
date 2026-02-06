@@ -27,20 +27,47 @@ SAM3_CHECKPOINT = "sam3.pt"
 # ---------------------------------------------------------------------------
 def _ensure_sam3_importable():
     """Make the bundled ``lib/sam3`` importable if the system package is absent."""
-    try:
-        import sam3  # noqa: F401 — already installed
-        return True
-    except ImportError:
-        pass
-
+    # First, add the lib directory to path
     lib_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib")
     if lib_dir not in sys.path:
         sys.path.insert(0, lib_dir)
+        print(f"[SAM3] Added to path: {lib_dir}")
     
+    # Check critical dependencies first
+    missing_deps = []
+    for dep in ['torch', 'torchvision', 'numpy', 'cv2', 'PIL', 'tqdm', 'huggingface_hub', 'ftfy', 'regex', 'timm']:
+        try:
+            __import__(dep.replace('PIL', 'PIL.Image').split('.')[0])
+        except ImportError:
+            missing_deps.append(dep)
+    
+    if missing_deps:
+        print(f"[SAM3] Missing dependencies: {missing_deps}")
+        print(f"[SAM3] Please install: pip install {' '.join(missing_deps)}")
+        return False
+    
+    # Now try to import sam3
     try:
-        import sam3  # noqa: F401
+        # Import step by step to find the exact failure point
+        print("[SAM3] Testing import: sam3.model.model_misc...")
+        from sam3.model.model_misc import MLP
+        
+        print("[SAM3] Testing import: sam3.model.decoder...")
+        from sam3.model.decoder import TransformerDecoder
+        
+        print("[SAM3] Testing import: sam3.model.vitdet...")
+        from sam3.model.vitdet import ViT
+        
+        print("[SAM3] Testing import: sam3.model_builder...")
+        from sam3.model_builder import build_sam3_video_model
+        
+        print("[SAM3] All imports successful!")
         return True
-    except ImportError:
+        
+    except Exception as e:
+        print(f"[SAM3] Import failed: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 

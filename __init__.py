@@ -25,7 +25,7 @@ Author:  Claude (Anthropic) for SAM3DBody2abc project
 License: Apache 2.0  (SAM3 model code is Meta Platforms Inc., Apache 2.0)
 """
 
-__version__ = "1.1.3"
+__version__ = "1.1.4"
 
 import os
 import importlib.util

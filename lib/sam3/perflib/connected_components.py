@@ -76,11 +76,14 @@ def connected_components(input_tensor: torch.Tensor):
             return get_connected_components(input_tensor.to(torch.uint8))
         else:
             # triton fallback
-            from sam3.perflib.triton.connected_components import (
-                connected_components_triton,
-            )
-
-            return connected_components_triton(input_tensor)
+            try:
+                from sam3.perflib.triton.connected_components import (
+                    connected_components_triton,
+                )
+                return connected_components_triton(input_tensor)
+            except ImportError:
+                # triton not available, fall through to CPU fallback
+                pass
 
     # CPU fallback
     return connected_components_cpu(input_tensor)

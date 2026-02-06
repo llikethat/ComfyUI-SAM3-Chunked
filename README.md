@@ -23,19 +23,31 @@ This package processes frames in configurable **chunks** (default 100 frames ≈
 
 ## Installation
 
-1. Clone into your ComfyUI `custom_nodes/` folder:
+1. Extract into your ComfyUI `custom_nodes/` folder:
    ```bash
    cd ComfyUI/custom_nodes/
-   # Place the ComfyUI-SAM3-Chunked folder here
+   # Extract ComfyUI-SAM3-Chunked folder here
    ```
 
-2. Download the SAM3 checkpoint to `ComfyUI/models/sam3/`:
+2. Install dependencies:
    ```bash
-   mkdir -p models/sam3
-   # Download sam3.pt from HuggingFace (or let the node auto-download)
+   cd ComfyUI-SAM3-Chunked
+   pip install -r requirements.txt
    ```
 
 3. **Remove or disable** the original `ComfyUI-SAM3` package to avoid node-name conflicts (both packages register the same node names).
+
+## HuggingFace Authentication (Required)
+
+The `facebook/sam3` model on HuggingFace is **gated** — you must:
+
+1. **Accept the license** at https://huggingface.co/facebook/sam3
+2. **Authenticate** using ONE of these methods:
+   - Enter your token in the `hf_token` field on the LoadSAM3Model node
+   - Set environment variable: `export HF_TOKEN=your_token_here`
+   - Run in terminal: `huggingface-cli login`
+
+The model (~3.2GB) will auto-download to `ComfyUI/models/sam3/sam3.pt` on first use.
 
 ## Nodes
 
@@ -66,9 +78,17 @@ All nodes use **identical names and types** as the original package, so existing
 
 The package includes SAM3's core model code (`lib/sam3/`) so it works **standalone** — no separate `pip install sam3` required. If you do have SAM3 installed system-wide, that installation takes priority.
 
-## Model Download
+## Troubleshooting
 
-The `LoadSAM3Model` node auto-downloads models from HuggingFace on first use. If the repo is gated, provide your HuggingFace token in the `hf_token` input.
+### Import Errors
+If you see `[SAM3] Cannot import sam3 library`, check the ComfyUI console for detailed error messages. Common issues:
+- Missing dependencies: `pip install huggingface_hub ftfy regex timm`
+- Python version too old: requires Python 3.10+
+
+### Model Download Fails
+- Ensure you've accepted the license at https://huggingface.co/facebook/sam3
+- Verify your HF token is correct
+- Check network connectivity to huggingface.co
 
 ## Compatibility
 
