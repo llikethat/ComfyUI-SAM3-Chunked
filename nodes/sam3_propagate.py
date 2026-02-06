@@ -24,6 +24,7 @@ import sys
 import torch
 import numpy as np
 import cv2
+from PIL import Image
 from tqdm.auto import tqdm
 from typing import Dict, List, Optional, Tuple
 
@@ -57,6 +58,15 @@ def _ensure_sam3():
             return True
         except ImportError:
             return False
+
+
+def _np_to_pil_list(images_np: np.ndarray, start: int, end: int) -> List[Image.Image]:
+    """Convert a slice of numpy frames to a list of PIL Images for SAM3 init_state."""
+    pil_list = []
+    for i in range(start, end):
+        frame = images_np[i]  # (H, W, 3) uint8
+        pil_list.append(Image.fromarray(frame))
+    return pil_list
 
 
 def _preprocess_chunk(
@@ -153,17 +163,16 @@ class SAM3Propagate:
             a, r = _vram_mb()
             print(f"[SAM3]   VRAM before load: {a:.0f}/{r:.0f} MB (alloc/reserved)")
 
-            chunk_frames = _preprocess_chunk(images_np, c_start, c_end, img_size, dtype, device)
-
             if has_native:
+                # Pass images_np - the native method will convert to PIL and handle GPU
                 c_masks, c_scores = self._propagate_native(
-                    model, chunk_frames, c_start, c_end,
+                    model, images_np, c_start, c_end,
                     prompt, prev_mask, direction, device, dtype,
                     video_state,
                 )
             else:
                 c_masks, c_scores = self._propagate_fallback(
-                    model, chunk_frames, c_start, c_end,
+                    model, images_np, c_start, c_end,
                     prompt, prev_mask, direction, video_state,
                 )
 
@@ -182,7 +191,7 @@ class SAM3Propagate:
             else:
                 prev_mask = None
 
-            del chunk_frames, c_masks, c_scores
+            del c_masks, c_scores
             if clear_cache:
                 _clear_gpu()
                 a, r = _vram_mb()
@@ -200,124 +209,190 @@ class SAM3Propagate:
 
     # ── native SAM3 API ──────────────────────────────────────
     def _propagate_native(
-        self, model, chunk_frames, c_start, c_end,
+        self, model, images_np, c_start, c_end,
         prompt, prev_mask, direction, device, dtype, video_state,
     ):
-        """Run SAM3's own ``init_state`` / ``add_*`` / ``propagate_in_video``
-        on a chunk of frames that are *already* on the GPU."""
+        """Run SAM3's own ``init_state`` / ``add_prompt`` / ``propagate_in_video``
+        on a chunk of frames."""
 
         orig_h = video_state["orig_height"]
         orig_w = video_state["orig_width"]
+        n_frames = c_end - c_start
 
         try:
-            # SAM3 init_state can accept a tensor batch directly (since it
-            # ultimately stores images in ``BatchedDatapoint.img_batch``).
-            # If the API only accepts a path we fall back to the simple path.
-            inf = model.init_state(chunk_frames, offload_video_to_cpu=True)
+            # Convert numpy frames to PIL Images (SAM3 init_state accepts list of PIL)
+            pil_frames = _np_to_pil_list(images_np, c_start, c_end)
+            
+            # Initialize SAM3 inference state with PIL images
+            inf = model.init_state(pil_frames, offload_video_to_cpu=True)
 
             # ── prompts ──
             if c_start == 0 or prev_mask is None:
                 self._apply_initial_prompt(model, inf, prompt, device, dtype, orig_h, orig_w)
             else:
-                # Seed from previous chunk's last mask
-                model.add_new_mask(inf, frame_idx=0, mask=prev_mask.to(device))
+                # Seed from previous chunk's last mask - try to add as box prompt
+                try:
+                    # Find bounding box of previous mask
+                    mask_np = prev_mask.cpu().numpy() if torch.is_tensor(prev_mask) else prev_mask
+                    if mask_np.ndim > 2:
+                        mask_np = mask_np.squeeze()
+                    
+                    # Get bounding box from mask
+                    ys, xs = np.where(mask_np > 0.5)
+                    if len(ys) > 0:
+                        x1, y1, x2, y2 = xs.min(), ys.min(), xs.max(), ys.max()
+                        # Normalize to 0-1
+                        box_xywh = torch.tensor([[
+                            x1 / orig_w,
+                            y1 / orig_h,
+                            (x2 - x1) / orig_w,
+                            (y2 - y1) / orig_h
+                        ]], dtype=torch.float32)
+                        model.add_prompt(inf, frame_idx=0, boxes_xywh=box_xywh, box_labels=torch.tensor([1]))
+                    else:
+                        # Fallback: re-apply initial prompt
+                        self._apply_initial_prompt(model, inf, prompt, device, dtype, orig_h, orig_w)
+                except Exception as e:
+                    print(f"[SAM3]   Could not add previous mask: {e}")
+                    # Fallback: re-apply initial prompt
+                    self._apply_initial_prompt(model, inf, prompt, device, dtype, orig_h, orig_w)
 
             # ── propagate ──
             masks_list = []
             scores_list = []
-            for out in model.propagate_in_video(
+            
+            for frame_idx, out in model.propagate_in_video(
                 inf,
                 start_frame_idx=0,
+                max_frame_num_to_track=n_frames,
                 reverse=(direction == "backward"),
             ):
-                masks_list.append(out["masks"].cpu())
-                if "scores" in out:
-                    scores_list.append(out["scores"].cpu())
+                if out is None:
+                    # No output for this frame - add placeholder
+                    masks_list.append(torch.zeros(orig_h, orig_w, dtype=torch.float32))
+                    scores_list.append(torch.tensor(0.0))
+                    continue
+                    
+                # out contains: out_obj_ids, out_probs, out_boxes_xywh, out_binary_masks
+                binary_masks = out.get("out_binary_masks")  # numpy (N_objects, H, W) bool
+                probs = out.get("out_probs")  # numpy (N_objects,)
+                
+                if binary_masks is not None and len(binary_masks) > 0:
+                    # Combine all object masks into one (union)
+                    combined_mask = np.any(binary_masks, axis=0)  # (H, W)
+                    mask_tensor = torch.from_numpy(combined_mask.astype(np.float32))
+                    
+                    # Resize to original resolution if needed
+                    mask_h, mask_w = mask_tensor.shape
+                    if mask_h != orig_h or mask_w != orig_w:
+                        mask_tensor = torch.nn.functional.interpolate(
+                            mask_tensor.unsqueeze(0).unsqueeze(0),
+                            size=(orig_h, orig_w),
+                            mode="bilinear",
+                            align_corners=False
+                        ).squeeze()
+                    
+                    masks_list.append(mask_tensor)
+                    scores_list.append(torch.tensor(probs.max() if probs is not None and len(probs) > 0 else 1.0))
+                else:
+                    # No masks for this frame - add placeholder
+                    masks_list.append(torch.zeros(orig_h, orig_w, dtype=torch.float32))
+                    scores_list.append(torch.tensor(0.0))
 
-            masks  = torch.cat(masks_list, dim=0) if masks_list else torch.zeros(0)
-            scores = torch.cat(scores_list, dim=0) if scores_list else None
+            if masks_list:
+                masks = torch.stack(masks_list, dim=0).unsqueeze(1)  # (N, 1, H, W)
+                scores = torch.stack(scores_list) if scores_list else None
+                # Debug: check if we got real masks
+                nonzero_masks = sum(1 for m in masks_list if m.sum() > 0)
+                print(f"[SAM3]   Generated {len(masks_list)} masks, {nonzero_masks} non-empty")
+            else:
+                masks = torch.zeros(n_frames, 1, orig_h, orig_w, dtype=torch.float32)
+                scores = None
+                print(f"[SAM3]   WARNING: No masks generated!")
+                
             return masks, scores
 
         except Exception as e:
             print(f"[SAM3]   native propagation failed ({e}), using fallback")
+            import traceback
+            traceback.print_exc()
             return self._propagate_fallback(
-                model, chunk_frames, c_start, c_end,
+                model, images_np, c_start, c_end,
                 prompt, prev_mask, direction, video_state,
             )
 
     def _apply_initial_prompt(self, model, inf, prompt, device, dtype, orig_h, orig_w):
-        """Apply the user's prompt (box / point / text) to the SAM3 inference state."""
+        """Apply the user's prompt (box / point / text) to the SAM3 inference state.
+        
+        SAM3's add_prompt expects:
+        - text_str: optional text prompt
+        - boxes_xywh: optional boxes in [xmin, ymin, width, height] NORMALIZED (0-1)
+        - box_labels: labels for boxes (1=positive, 0=negative)
+        """
         ptype = prompt.get("type", "box")
         frame = prompt.get("frame", 0)
 
         pos = prompt.get("positive")
         neg = prompt.get("negative")
-
-        # ── Box prompts ──
+        
+        # Prepare box prompts (normalized to 0-1)
+        boxes_xywh = None
+        box_labels = None
+        
         if ptype in ("box", "auto") and pos is not None:
-            boxes = pos.get("boxes")
+            boxes = pos.get("boxes")  # Expected: (N, 4) in xyxy format, pixel coords
             if boxes is not None and len(boxes) > 0:
-                labels = pos.get("labels", torch.ones(len(boxes), dtype=torch.long))
-                try:
-                    model.add_new_points_or_box(
-                        inf, frame_idx=frame, box=boxes.to(device), box_label=labels.to(device),
-                    )
-                    return
-                except Exception:
-                    pass  # fall through
-
-        # ── Point prompts ──
-        pos_pts = prompt.get("positive_points")
-        neg_pts = prompt.get("negative_points")
-
-        if ptype in ("point", "auto") and pos_pts is not None:
-            points_data = pos_pts.get("points")
-            if points_data is not None and len(points_data) > 0:
-                # Combine positive and negative points
-                all_points = [points_data]
-                all_labels = [torch.ones(len(points_data), dtype=torch.long)]
-
-                if neg_pts is not None:
-                    neg_data = neg_pts.get("points")
-                    if neg_data is not None and len(neg_data) > 0:
-                        all_points.append(neg_data)
-                        all_labels.append(torch.zeros(len(neg_data), dtype=torch.long))
-
-                combined_points = torch.cat(all_points, dim=0)
-                combined_labels = torch.cat(all_labels, dim=0)
-
-                try:
-                    model.add_new_points_or_box(
-                        inf, frame_idx=frame,
-                        points=combined_points.to(device),
-                        labels=combined_labels.to(device),
-                    )
-                    return
-                except Exception:
-                    pass  # fall through
-
-        # ── Text prompts ──
+                # Convert xyxy to xywh and normalize
+                boxes_np = boxes.cpu().numpy() if torch.is_tensor(boxes) else boxes
+                boxes_xywh_list = []
+                labels_list = []
+                
+                for box in boxes_np:
+                    x1, y1, x2, y2 = box
+                    # Convert to normalized xywh
+                    w = x2 - x1
+                    h = y2 - y1
+                    # Normalize to 0-1
+                    boxes_xywh_list.append([
+                        x1 / orig_w,
+                        y1 / orig_h,
+                        w / orig_w,
+                        h / orig_h
+                    ])
+                    labels_list.append(1)  # positive
+                
+                boxes_xywh = torch.tensor(boxes_xywh_list, dtype=torch.float32)
+                box_labels = torch.tensor(labels_list, dtype=torch.long)
+        
+        # Get text prompt
         text = prompt.get("text", "")
-        if ptype in ("text", "auto") and text:
-            try:
-                model.add_new_text(inf, text=text)
-                return
-            except Exception:
-                pass
-
-        # Last resort — centre box covering middle 50 %
-        cx, cy = orig_w / 2, orig_h / 2
-        hw, hh = orig_w / 4, orig_h / 4
-        fallback_box = torch.tensor([[cx - hw, cy - hh, cx + hw, cy + hh]], dtype=torch.float32)
+        text_str = text if ptype in ("text", "auto") and text else None
+        
+        # Call SAM3's add_prompt
         try:
-            model.add_new_points_or_box(inf, frame_idx=0, box=fallback_box.to(device))
-        except Exception:
-            pass
+            if boxes_xywh is not None or text_str:
+                model.add_prompt(
+                    inf,
+                    frame_idx=frame,
+                    text_str=text_str,
+                    boxes_xywh=boxes_xywh,
+                    box_labels=box_labels,
+                )
+                return
+        except Exception as e:
+            print(f"[SAM3]   add_prompt failed: {e}")
+        
+        # Fallback: centre box covering middle 50%
+        fallback_box = torch.tensor([[0.25, 0.25, 0.5, 0.5]], dtype=torch.float32)  # normalized xywh
+        try:
+            model.add_prompt(inf, frame_idx=0, boxes_xywh=fallback_box, box_labels=torch.tensor([1]))
+        except Exception as e:
+            print(f"[SAM3]   fallback prompt also failed: {e}")
 
     # ── fallback (no native API) ─────────────────────────────
     @staticmethod
     def _propagate_fallback(
-        model, chunk_frames, c_start, c_end,
+        model, images_np, c_start, c_end,
         prompt, prev_mask, direction, video_state,
     ):
         """Simple carry-forward mask propagation when the SAM3 model API

@@ -95,19 +95,26 @@ class SAM3VideoOutput:
         # frames  = original video
         # visualization = original + coloured mask overlay
         if video_state is not None and "images_np" in video_state:
-            imgs = video_state["images_np"]  # uint8
-            frames_out = torch.from_numpy(imgs[sorted_keys].astype(np.float32) / 255.0) \
-                if isinstance(sorted_keys, np.ndarray) \
-                else torch.stack([
-                    torch.from_numpy(imgs[k].astype(np.float32) / 255.0)
-                    for k in sorted_keys
-                ])
+            imgs = video_state["images_np"]  # uint8 (N, H, W, 3)
+            # Build frames for each sorted key
+            frame_list = []
+            for k in sorted_keys:
+                if k < len(imgs):
+                    frame_list.append(torch.from_numpy(imgs[k].astype(np.float32) / 255.0))
+                else:
+                    # Fallback for missing frames
+                    frame_list.append(torch.zeros(orig_h, orig_w, 3, dtype=torch.float32))
+            frames_out = torch.stack(frame_list) if frame_list else torch.zeros(n, orig_h, orig_w, 3, dtype=torch.float32)
         else:
             frames_out = torch.zeros(n, orig_h, orig_w, 3, dtype=torch.float32)
 
         if visualize and frames_out.shape[0] == n:
+            # Check if masks have any non-zero values
+            nonzero_count = (out_masks.sum(dim=(1, 2)) > 0).sum().item()
+            print(f"[SAM3] VideoOutput: {nonzero_count}/{n} masks are non-empty, applying visualization")
             vis = self._overlay(frames_out, out_masks)
         else:
+            print(f"[SAM3] VideoOutput: visualization disabled or shape mismatch")
             vis = frames_out.clone()
 
         return (out_masks, frames_out, vis)
