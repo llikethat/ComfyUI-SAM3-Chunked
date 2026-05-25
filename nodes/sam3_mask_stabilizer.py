@@ -22,13 +22,80 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import cv2
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple, List, Union, Any
 
 try:
     from scipy import ndimage
     HAS_SCIPY = True
 except ImportError:
     HAS_SCIPY = False
+
+
+def _get_video_state_attr(video_state: Any, key: str, default=None):
+    """
+    Get attribute from video_state regardless of whether it's a dict or dataclass.
+    
+    Handles both:
+    - Dict: video_state["key"] or video_state.get("key")
+    - Dataclass (SAM3VideoState): video_state.key or getattr(video_state, key)
+    """
+    # Try dict access first
+    if isinstance(video_state, dict):
+        return video_state.get(key, default)
+    
+    # Try attribute access (for dataclass)
+    if hasattr(video_state, key):
+        return getattr(video_state, key, default)
+    
+    # Handle key name differences between dict and dataclass
+    # Dict uses: orig_height, orig_width, images_np
+    # Dataclass uses: height, width, (no images_np - loads from temp_dir)
+    key_mapping = {
+        "orig_height": "height",
+        "orig_width": "width",
+        "height": "orig_height",
+        "width": "orig_width",
+    }
+    
+    if key in key_mapping:
+        alt_key = key_mapping[key]
+        if hasattr(video_state, alt_key):
+            return getattr(video_state, alt_key, default)
+    
+    return default
+
+
+def _get_images_from_state(video_state: Any) -> Optional[np.ndarray]:
+    """
+    Get images array from video_state.
+    
+    For dict: video_state["images_np"]
+    For dataclass: Load from temp_dir
+    """
+    # Dict case
+    if isinstance(video_state, dict):
+        return video_state.get("images_np")
+    
+    # Dataclass case - load from temp_dir
+    if hasattr(video_state, 'temp_dir'):
+        temp_dir = video_state.temp_dir
+        num_frames = getattr(video_state, 'num_frames', 0)
+        
+        if temp_dir and num_frames > 0:
+            import os
+            from PIL import Image
+            
+            frames = []
+            for i in range(num_frames):
+                frame_path = os.path.join(temp_dir, f"{i:05d}.jpg")
+                if os.path.exists(frame_path):
+                    img = Image.open(frame_path)
+                    frames.append(np.array(img))
+            
+            if frames:
+                return np.stack(frames, axis=0)
+    
+    return None
 
 
 class SAM3MaskTemporalStabilizer:
@@ -109,7 +176,7 @@ class SAM3MaskTemporalStabilizer:
     def stabilize(
         self,
         masks: Dict[int, torch.Tensor],
-        video_state: Dict,
+        video_state,
         # Stage 1
         enable_confidence_smoothing: bool = True,
         confidence_ema_alpha: float = 0.3,
@@ -133,9 +200,10 @@ class SAM3MaskTemporalStabilizer:
     ):
         """Apply multi-stage temporal stabilization to masks."""
         
-        images_np = video_state.get("images_np")
-        orig_h = video_state["orig_height"]
-        orig_w = video_state["orig_width"]
+        # Get video properties (handles both dict and dataclass)
+        images_np = _get_images_from_state(video_state)
+        orig_h = _get_video_state_attr(video_state, "orig_height") or _get_video_state_attr(video_state, "height", 480)
+        orig_w = _get_video_state_attr(video_state, "orig_width") or _get_video_state_attr(video_state, "width", 640)
         
         sorted_keys = sorted(masks.keys())
         n_frames = len(sorted_keys)
@@ -154,12 +222,14 @@ class SAM3MaskTemporalStabilizer:
             mask_tensor = self._apply_confidence_ema(mask_tensor, alpha=confidence_ema_alpha)
         
         # Stage 2: Optical Flow Warping
-        if enable_flow_warping:
+        if enable_flow_warping and images_np is not None:
             print(f"[SAM3 Stabilizer] Stage 2: Optical Flow Warping (blend={flow_blend_alpha})")
             if optical_flow is not None:
                 mask_tensor = self._apply_external_flow(mask_tensor, optical_flow, blend_alpha=flow_blend_alpha)
             else:
                 mask_tensor = self._apply_farneback_flow(mask_tensor, images_np, sorted_keys, blend_alpha=flow_blend_alpha)
+        elif enable_flow_warping and images_np is None:
+            print(f"[SAM3 Stabilizer] Stage 2: Skipped (no images available)")
         
         # Stage 3: Distance Field Smoothing
         if enable_distance_field and HAS_SCIPY:
@@ -175,7 +245,7 @@ class SAM3MaskTemporalStabilizer:
             mask_tensor = self._apply_hysteresis(mask_tensor, original_masks, threshold=hysteresis_threshold)
         
         # Stage 5: BiRefNet Edge Refinement (Optional)
-        if enable_birefnet and birefnet_model is not None:
+        if enable_birefnet and birefnet_model is not None and images_np is not None:
             print(f"[SAM3 Stabilizer] Stage 5: BiRefNet Refinement")
             mask_tensor = self._apply_birefnet_refinement(mask_tensor, images_np, sorted_keys, birefnet_model)
         
@@ -183,7 +253,11 @@ class SAM3MaskTemporalStabilizer:
         stabilized_masks = self._tensor_to_dict(mask_tensor, sorted_keys)
         
         # Create debug visualization
-        debug_vis = self._create_debug_visualization(original_masks, mask_tensor, images_np, sorted_keys)
+        if images_np is not None:
+            debug_vis = self._create_debug_visualization(original_masks, mask_tensor, images_np, sorted_keys)
+        else:
+            # Fallback: create simple visualization without source frames
+            debug_vis = self._create_simple_debug_visualization(original_masks, mask_tensor, sorted_keys)
         
         # Scores (placeholder)
         scores = {k: torch.tensor(1.0) for k in sorted_keys}
@@ -419,6 +493,20 @@ class SAM3MaskTemporalStabilizer:
         
         return vis
     
+    def _create_simple_debug_visualization(self, original: torch.Tensor, stabilized: torch.Tensor, keys: List[int]) -> torch.Tensor:
+        """Create simple visualization when no source frames available."""
+        N, H, W = original.shape
+        vis = torch.zeros(N, H, W * 2, 3, dtype=torch.float32)
+        
+        for t in range(N):
+            # Original mask (red channel)
+            vis[t, :, :W, 0] = original[t]
+            
+            # Stabilized mask (green channel)
+            vis[t, :, W:, 1] = stabilized[t]
+        
+        return vis
+    
     def _get_edges(self, mask: np.ndarray, thickness: int = 2) -> np.ndarray:
         """Extract edges from binary mask."""
         mask_uint8 = (mask > 0.5).astype(np.uint8) * 255
@@ -451,7 +539,7 @@ class SAM3MaskTemporalMedian:
     FUNCTION = "filter"
     CATEGORY = "SAM3"
     
-    def filter(self, masks: Dict[int, torch.Tensor], video_state: Dict, window_size: int = 5, boundary_only: bool = True, boundary_pixels: int = 10):
+    def filter(self, masks: Dict[int, torch.Tensor], video_state, window_size: int = 5, boundary_only: bool = True, boundary_pixels: int = 10):
         sorted_keys = sorted(masks.keys())
         N = len(sorted_keys)
         
