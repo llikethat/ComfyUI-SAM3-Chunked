@@ -42,9 +42,7 @@ def _to_tensor(x) -> torch.Tensor:
 
 
 def _get_video_state_attr(video_state: Any, key: str, default=None):
-    """
-    Get attribute from video_state regardless of whether it's a dict or dataclass.
-    """
+    """Get attribute from video_state regardless of whether it's a dict or dataclass."""
     if isinstance(video_state, dict):
         return video_state.get(key, default)
     
@@ -67,9 +65,7 @@ def _get_video_state_attr(video_state: Any, key: str, default=None):
 
 
 def _get_images_from_state(video_state: Any) -> Optional[np.ndarray]:
-    """
-    Get images array from video_state.
-    """
+    """Get images array from video_state."""
     if isinstance(video_state, dict):
         return video_state.get("images_np")
     
@@ -95,9 +91,7 @@ def _get_images_from_state(video_state: Any) -> Optional[np.ndarray]:
 
 
 class SAM3MaskTemporalStabilizer:
-    """
-    Temporal stabilization for SAM3 video masks.
-    """
+    """Temporal stabilization for SAM3 video masks."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -187,7 +181,6 @@ class SAM3MaskTemporalStabilizer:
         
         print(f"[SAM3 Stabilizer] Processing {n_frames} frames ({orig_w}x{orig_h})")
         
-        # Convert dict to tensor for processing
         mask_tensor = self._dict_to_tensor(masks, sorted_keys, orig_h, orig_w)
         original_masks = mask_tensor.clone()
         
@@ -224,10 +217,8 @@ class SAM3MaskTemporalStabilizer:
             print(f"[SAM3 Stabilizer] Stage 5: BiRefNet Refinement")
             mask_tensor = self._apply_birefnet_refinement(mask_tensor, images_np, sorted_keys, birefnet_model)
         
-        # Convert back to dict
         stabilized_masks = self._tensor_to_dict(mask_tensor, sorted_keys)
         
-        # Create debug visualization
         if images_np is not None:
             debug_vis = self._create_debug_visualization(original_masks, mask_tensor, images_np, sorted_keys)
         else:
@@ -239,10 +230,10 @@ class SAM3MaskTemporalStabilizer:
         return (stabilized_masks, scores, video_state, debug_vis)
 
     def _dict_to_tensor(self, masks: Dict, keys: List[int], H: int, W: int) -> torch.Tensor:
-        """Convert mask dict to (N, H, W) tensor. Handles both numpy and torch."""
+        """Convert mask dict to (N, H, W) tensor."""
         out = torch.zeros(len(keys), H, W, dtype=torch.float32)
         for i, k in enumerate(keys):
-            m = _to_tensor(masks[k])  # Convert numpy or tensor to torch
+            m = _to_tensor(masks[k])
             if m.dim() > 2:
                 m = m.squeeze()
             if m.shape[-2:] != (H, W):
@@ -341,29 +332,41 @@ class SAM3MaskTemporalStabilizer:
         return F.grid_sample(mask, grid + flow_norm, mode='bilinear', padding_mode='border', align_corners=True)
 
     def _apply_distance_field_smoothing(self, masks: torch.Tensor, sigma: float, edge_band: int, boundary_only: bool, boundary_pixels: int) -> torch.Tensor:
-        """Smooth masks via signed distance field."""
+        """Smooth masks via signed distance field with temporal smoothing."""
         if not HAS_SCIPY:
             return masks
             
         N, H, W = masks.shape
         
+        # Convert each mask to SDF
         sdf_stack = torch.zeros(N, H, W)
         for t in range(N):
             sdf_stack[t] = torch.from_numpy(self._mask_to_sdf(masks[t].numpy()))
         
+        # Temporal smoothing on SDF using manual convolution
         if sigma > 0:
-            kernel_size = int(6 * sigma) | 1
+            kernel_size = int(6 * sigma) | 1  # Ensure odd
+            half_k = kernel_size // 2
             kernel = self._gaussian_kernel_1d(kernel_size, sigma)
             
-            sdf_padded = F.pad(sdf_stack, (0, 0, 0, 0, kernel_size//2, kernel_size//2), mode='replicate')
+            # Manual temporal convolution (no F.pad needed)
             sdf_smoothed = torch.zeros_like(sdf_stack)
-            
             for t in range(N):
-                for k, w in enumerate(kernel):
-                    sdf_smoothed[t] += w * sdf_padded[t + k]
+                weighted_sum = torch.zeros(H, W)
+                weight_total = 0.0
+                for k_idx, k_weight in enumerate(kernel):
+                    src_t = t - half_k + k_idx
+                    if 0 <= src_t < N:
+                        weighted_sum += k_weight * sdf_stack[src_t]
+                        weight_total += k_weight
+                if weight_total > 0:
+                    sdf_smoothed[t] = weighted_sum / weight_total
+                else:
+                    sdf_smoothed[t] = sdf_stack[t]
         else:
             sdf_smoothed = sdf_stack
         
+        # Apply smoothed SDF
         if boundary_only:
             result = masks.clone()
             for t in range(N):
