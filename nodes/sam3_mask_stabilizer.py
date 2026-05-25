@@ -6,10 +6,10 @@ Fix edge flicker and temporal instability in SAM3 video masks.
 
 Pipeline (Quality Mode):
     1. Logit/Confidence Smoothing (EMA on soft masks) - BOUNDARY ONLY
-    2. Optical Flow Warping (temporal consistency) - BOUNDARY ONLY
+    2. Optical Flow Warping (temporal consistency) - BOUNDARY ONLY  
     3. Distance Field Smoothing (smooth edges via SDF) - BOUNDARY ONLY
     4. Temporal Hysteresis (stable pixels unless confidence changes)
-    5. Final Binarization (clean up any ghosting)
+    5. Edge-Preserving Merge (prevent erosion)
 
 Usage:
     SAM3Propagate → SAM3MaskTemporalStabilizer → SAM3VideoOutput
@@ -88,7 +88,17 @@ def _get_images_from_state(video_state: Any) -> Optional[np.ndarray]:
 
 
 def _get_boundary_mask(mask: np.ndarray, pixels: int) -> np.ndarray:
-    """Get binary mask of boundary region."""
+    """Get binary mask of boundary region (outside edge only for smoothing)."""
+    mask_bool = (mask > 0.5).astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (pixels*2+1, pixels*2+1))
+    dilated = cv2.dilate(mask_bool, kernel)
+    # Boundary is the DILATED region minus the original - this is OUTSIDE the edge
+    # This ensures we only smooth outward, never erode inward
+    return (dilated > mask_bool)
+
+
+def _get_edge_region(mask: np.ndarray, pixels: int) -> np.ndarray:
+    """Get edge region that spans both inside and outside."""
     mask_bool = (mask > 0.5).astype(np.uint8)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (pixels*2+1, pixels*2+1))
     dilated = cv2.dilate(mask_bool, kernel)
@@ -141,12 +151,16 @@ class SAM3MaskTemporalStabilizer:
                     "tooltip": "Optional: BiRefNet model from Load BiRefNet node"
                 }),
                 
-                "boundary_pixels": ("INT", {"default": 20, "min": 5, "max": 50,
+                "boundary_pixels": ("INT", {"default": 15, "min": 5, "max": 50,
                     "tooltip": "Pixel width of boundary region to stabilize"
                 }),
                 
-                "binarize_threshold": ("FLOAT", {"default": 0.5, "min": 0.1, "max": 0.9, "step": 0.05,
-                    "tooltip": "Final binarization threshold to remove ghosting"
+                "edge_bias": ("FLOAT", {"default": 0.0, "min": -5.0, "max": 5.0, "step": 0.5,
+                    "tooltip": "Positive = expand edges, Negative = shrink. Use positive to prevent erosion."
+                }),
+                
+                "preserve_original_coverage": ("BOOLEAN", {"default": True,
+                    "tooltip": "Union with original mask to prevent ANY erosion"
                 }),
             },
         }
@@ -171,10 +185,11 @@ class SAM3MaskTemporalStabilizer:
         hysteresis_threshold: float = 0.15,
         enable_birefnet: bool = False,
         birefnet_model = None,
-        boundary_pixels: int = 20,
-        binarize_threshold: float = 0.5,
+        boundary_pixels: int = 15,
+        edge_bias: float = 0.0,
+        preserve_original_coverage: bool = True,
     ):
-        """Apply multi-stage temporal stabilization to masks - BOUNDARY ONLY to prevent ghosting."""
+        """Apply multi-stage temporal stabilization to masks - prevents erosion."""
         
         images_np = _get_images_from_state(video_state)
         orig_h = _get_video_state_attr(video_state, "orig_height") or _get_video_state_attr(video_state, "height", 480)
@@ -187,44 +202,32 @@ class SAM3MaskTemporalStabilizer:
         
         # Convert to tensor and binarize input
         mask_tensor = self._dict_to_tensor(masks, sorted_keys, orig_h, orig_w)
-        original_binary = (mask_tensor > 0.5).float()  # Keep original binary for interior
+        original_binary = (mask_tensor > 0.5).float()  # Keep original for union later
         
-        # Working copy for boundary smoothing
+        # Working copy
         working_masks = mask_tensor.clone()
         
-        # Pre-compute boundary masks for all frames
-        boundary_masks = torch.zeros_like(mask_tensor, dtype=torch.bool)
-        for t in range(n_frames):
-            boundary_masks[t] = torch.from_numpy(_get_boundary_mask(mask_tensor[t].numpy(), boundary_pixels))
-        
-        # Stage 1: Confidence/Logit EMA Smoothing (BOUNDARY ONLY)
+        # Stage 1: Confidence/Logit EMA Smoothing
         if enable_confidence_smoothing:
             print(f"[SAM3 Stabilizer] Stage 1: Confidence EMA (alpha={confidence_ema_alpha})")
-            smoothed = self._apply_confidence_ema(working_masks, alpha=confidence_ema_alpha)
-            # Apply only to boundaries
-            for t in range(n_frames):
-                working_masks[t] = torch.where(boundary_masks[t], smoothed[t], original_binary[t])
+            working_masks = self._apply_confidence_ema(working_masks, alpha=confidence_ema_alpha)
         
-        # Stage 2: Optical Flow Warping (BOUNDARY ONLY)
+        # Stage 2: Optical Flow Warping
         if enable_flow_warping and images_np is not None:
             print(f"[SAM3 Stabilizer] Stage 2: Optical Flow Warping (blend={flow_blend_alpha})")
             if optical_flow is not None:
-                flow_result = self._apply_external_flow(working_masks, optical_flow, blend_alpha=flow_blend_alpha)
+                working_masks = self._apply_external_flow(working_masks, optical_flow, blend_alpha=flow_blend_alpha)
             else:
-                flow_result = self._apply_farneback_flow(working_masks, images_np, sorted_keys, blend_alpha=flow_blend_alpha)
-            # Apply only to boundaries
-            for t in range(n_frames):
-                working_masks[t] = torch.where(boundary_masks[t], flow_result[t], original_binary[t])
+                working_masks = self._apply_farneback_flow(working_masks, images_np, sorted_keys, blend_alpha=flow_blend_alpha)
         elif enable_flow_warping and images_np is None:
             print(f"[SAM3 Stabilizer] Stage 2: Skipped (no images available)")
         
-        # Stage 3: Distance Field Smoothing (BOUNDARY ONLY)
+        # Stage 3: Distance Field Smoothing
         if enable_distance_field and HAS_SCIPY:
-            print(f"[SAM3 Stabilizer] Stage 3: Distance Field (sigma={sdf_smoothing_sigma})")
-            sdf_result = self._apply_distance_field_smoothing(working_masks, sigma=sdf_smoothing_sigma, boundary_pixels=boundary_pixels)
-            # Apply only to boundaries
-            for t in range(n_frames):
-                working_masks[t] = torch.where(boundary_masks[t], sdf_result[t], original_binary[t])
+            print(f"[SAM3 Stabilizer] Stage 3: Distance Field (sigma={sdf_smoothing_sigma}, bias={edge_bias})")
+            working_masks = self._apply_distance_field_smoothing(
+                working_masks, sigma=sdf_smoothing_sigma, edge_bias=edge_bias
+            )
         
         # Stage 4: Temporal Hysteresis
         if enable_hysteresis:
@@ -236,9 +239,14 @@ class SAM3MaskTemporalStabilizer:
             print(f"[SAM3 Stabilizer] Stage 5: BiRefNet Refinement")
             working_masks = self._apply_birefnet_refinement(working_masks, images_np, sorted_keys, birefnet_model)
         
-        # Stage 6: FINAL BINARIZATION - Remove all ghosting
-        print(f"[SAM3 Stabilizer] Stage 6: Final Binarization (threshold={binarize_threshold})")
-        final_masks = (working_masks > binarize_threshold).float()
+        # Stage 6: Binarize
+        final_masks = (working_masks > 0.5).float()
+        
+        # Stage 7: PRESERVE ORIGINAL COVERAGE - Union with original to prevent erosion
+        if preserve_original_coverage:
+            print(f"[SAM3 Stabilizer] Stage 6: Preserving original coverage (union)")
+            # Union: take max of original and smoothed - this ensures we NEVER lose coverage
+            final_masks = torch.maximum(final_masks, original_binary)
         
         stabilized_masks = self._tensor_to_dict(final_masks, sorted_keys)
         
@@ -354,7 +362,7 @@ class SAM3MaskTemporalStabilizer:
         
         return F.grid_sample(mask, grid + flow_norm, mode='bilinear', padding_mode='border', align_corners=True)
 
-    def _apply_distance_field_smoothing(self, masks: torch.Tensor, sigma: float, boundary_pixels: int) -> torch.Tensor:
+    def _apply_distance_field_smoothing(self, masks: torch.Tensor, sigma: float, edge_bias: float) -> torch.Tensor:
         """Smooth masks via signed distance field with temporal smoothing."""
         if not HAS_SCIPY:
             return masks
@@ -388,8 +396,11 @@ class SAM3MaskTemporalStabilizer:
         else:
             sdf_smoothed = sdf_stack
         
-        # Threshold SDF to get binary mask
-        return (sdf_smoothed > 0).float()
+        # Apply edge bias: positive = expand, negative = shrink
+        # Threshold at -edge_bias instead of 0
+        # e.g., edge_bias=2 means threshold at -2, so pixels with SDF > -2 become foreground (expands)
+        threshold = -edge_bias
+        return (sdf_smoothed > threshold).float()
     
     def _mask_to_sdf(self, mask: np.ndarray) -> np.ndarray:
         """Convert binary mask to signed distance field."""
@@ -502,8 +513,7 @@ class SAM3MaskTemporalMedian:
             },
             "optional": {
                 "window_size": ("INT", {"default": 5, "min": 3, "max": 15, "step": 2}),
-                "boundary_only": ("BOOLEAN", {"default": True}),
-                "boundary_pixels": ("INT", {"default": 10, "min": 3, "max": 30}),
+                "preserve_original_coverage": ("BOOLEAN", {"default": True}),
             },
         }
     
@@ -512,7 +522,7 @@ class SAM3MaskTemporalMedian:
     FUNCTION = "filter"
     CATEGORY = "SAM3"
     
-    def filter(self, masks: Dict, video_state, window_size: int = 5, boundary_only: bool = True, boundary_pixels: int = 10):
+    def filter(self, masks: Dict, video_state, window_size: int = 5, preserve_original_coverage: bool = True):
         sorted_keys = sorted(masks.keys())
         N = len(sorted_keys)
         
@@ -543,17 +553,15 @@ class SAM3MaskTemporalMedian:
             t_start = max(0, t - half)
             t_end = min(N, t + half + 1)
             window = original_binary[t_start:t_end]
-            
             median_mask = torch.median(window, dim=0).values
-            
-            if boundary_only:
-                boundary = torch.from_numpy(_get_boundary_mask(original_binary[t].numpy(), boundary_pixels))
-                result[t] = torch.where(boundary, median_mask, original_binary[t])
-            else:
-                result[t] = median_mask
+            result[t] = median_mask
         
         # Final binarization
         result = (result > 0.5).float()
+        
+        # Preserve original coverage
+        if preserve_original_coverage:
+            result = torch.maximum(result, original_binary)
         
         return ({k: result[i] for i, k in enumerate(sorted_keys)}, video_state)
 
