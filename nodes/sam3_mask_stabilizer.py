@@ -101,8 +101,8 @@ class SAM3MaskTemporalStabilizer:
             },
         }
 
-    RETURN_TYPES = ("SAM3_VIDEO_MASKS", "SAM3_VIDEO_SCORES", "IMAGE")
-    RETURN_NAMES = ("stabilized_masks", "scores", "debug_visualization")
+    RETURN_TYPES = ("SAM3_VIDEO_MASKS", "SAM3_VIDEO_SCORES", "SAM3_VIDEO_STATE", "IMAGE")
+    RETURN_NAMES = ("stabilized_masks", "scores", "video_state", "debug_visualization")
     FUNCTION = "stabilize"
     CATEGORY = "SAM3"
 
@@ -189,7 +189,7 @@ class SAM3MaskTemporalStabilizer:
         scores = {k: torch.tensor(1.0) for k in sorted_keys}
         
         print(f"[SAM3 Stabilizer] Complete!")
-        return (stabilized_masks, scores, debug_vis)
+        return (stabilized_masks, scores, video_state, debug_vis)
 
     def _dict_to_tensor(self, masks: Dict[int, torch.Tensor], keys: List[int], H: int, W: int) -> torch.Tensor:
         """Convert mask dict to (N, H, W) tensor."""
@@ -437,6 +437,7 @@ class SAM3MaskTemporalMedian:
         return {
             "required": {
                 "masks": ("SAM3_VIDEO_MASKS",),
+                "video_state": ("SAM3_VIDEO_STATE",),
             },
             "optional": {
                 "window_size": ("INT", {"default": 5, "min": 3, "max": 15, "step": 2}),
@@ -445,17 +446,17 @@ class SAM3MaskTemporalMedian:
             },
         }
     
-    RETURN_TYPES = ("SAM3_VIDEO_MASKS",)
-    RETURN_NAMES = ("filtered_masks",)
+    RETURN_TYPES = ("SAM3_VIDEO_MASKS", "SAM3_VIDEO_STATE")
+    RETURN_NAMES = ("filtered_masks", "video_state")
     FUNCTION = "filter"
     CATEGORY = "SAM3"
     
-    def filter(self, masks: Dict[int, torch.Tensor], window_size: int = 5, boundary_only: bool = True, boundary_pixels: int = 10):
+    def filter(self, masks: Dict[int, torch.Tensor], video_state: Dict, window_size: int = 5, boundary_only: bool = True, boundary_pixels: int = 10):
         sorted_keys = sorted(masks.keys())
         N = len(sorted_keys)
         
         if N == 0:
-            return (masks,)
+            return (masks, video_state)
         
         first = masks[sorted_keys[0]]
         if first.dim() > 2:
@@ -488,7 +489,7 @@ class SAM3MaskTemporalMedian:
             else:
                 result[t] = median_mask
         
-        return ({k: result[i] for i, k in enumerate(sorted_keys)},)
+        return ({k: result[i] for i, k in enumerate(sorted_keys)}, video_state)
     
     def _get_boundary(self, mask: np.ndarray, pixels: int) -> np.ndarray:
         mask_bool = mask > 0.5
