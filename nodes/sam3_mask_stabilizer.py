@@ -31,25 +31,26 @@ except ImportError:
     HAS_SCIPY = False
 
 
+def _to_tensor(x) -> torch.Tensor:
+    """Convert numpy array or tensor to torch.Tensor."""
+    if isinstance(x, np.ndarray):
+        return torch.from_numpy(x.astype(np.float32))
+    elif isinstance(x, torch.Tensor):
+        return x.float()
+    else:
+        return torch.tensor(x, dtype=torch.float32)
+
+
 def _get_video_state_attr(video_state: Any, key: str, default=None):
     """
     Get attribute from video_state regardless of whether it's a dict or dataclass.
-    
-    Handles both:
-    - Dict: video_state["key"] or video_state.get("key")
-    - Dataclass (SAM3VideoState): video_state.key or getattr(video_state, key)
     """
-    # Try dict access first
     if isinstance(video_state, dict):
         return video_state.get(key, default)
     
-    # Try attribute access (for dataclass)
     if hasattr(video_state, key):
         return getattr(video_state, key, default)
     
-    # Handle key name differences between dict and dataclass
-    # Dict uses: orig_height, orig_width, images_np
-    # Dataclass uses: height, width, (no images_np - loads from temp_dir)
     key_mapping = {
         "orig_height": "height",
         "orig_width": "width",
@@ -68,15 +69,10 @@ def _get_video_state_attr(video_state: Any, key: str, default=None):
 def _get_images_from_state(video_state: Any) -> Optional[np.ndarray]:
     """
     Get images array from video_state.
-    
-    For dict: video_state["images_np"]
-    For dataclass: Load from temp_dir
     """
-    # Dict case
     if isinstance(video_state, dict):
         return video_state.get("images_np")
     
-    # Dataclass case - load from temp_dir
     if hasattr(video_state, 'temp_dir'):
         temp_dir = video_state.temp_dir
         num_frames = getattr(video_state, 'num_frames', 0)
@@ -101,12 +97,6 @@ def _get_images_from_state(video_state: Any) -> Optional[np.ndarray]:
 class SAM3MaskTemporalStabilizer:
     """
     Temporal stabilization for SAM3 video masks.
-    
-    Fixes:
-    - Edge flicker / crawling pixels
-    - Unstable hair and fine details
-    - Popping contours
-    - Motion blur artifacts
     """
 
     @classmethod
@@ -117,14 +107,12 @@ class SAM3MaskTemporalStabilizer:
                 "video_state": ("SAM3_VIDEO_STATE",),
             },
             "optional": {
-                # Stage 1: Confidence/Logit Smoothing
                 "enable_confidence_smoothing": ("BOOLEAN", {"default": True}),
                 "confidence_ema_alpha": ("FLOAT", {
                     "default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "EMA smoothing factor. Lower = more temporal smoothing"
                 }),
                 
-                # Stage 2: Optical Flow Warping
                 "enable_flow_warping": ("BOOLEAN", {"default": True}),
                 "flow_blend_alpha": ("FLOAT", {
                     "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
@@ -134,7 +122,6 @@ class SAM3MaskTemporalStabilizer:
                     "tooltip": "Optional: External flow from RAFT/GMFlow node"
                 }),
                 
-                # Stage 3: Distance Field Smoothing
                 "enable_distance_field": ("BOOLEAN", {"default": True}),
                 "sdf_smoothing_sigma": ("FLOAT", {
                     "default": 1.5, "min": 0.0, "max": 5.0, "step": 0.1,
@@ -145,14 +132,12 @@ class SAM3MaskTemporalStabilizer:
                     "tooltip": "Pixel band around edges to apply smoothing"
                 }),
                 
-                # Stage 4: Temporal Hysteresis
                 "enable_hysteresis": ("BOOLEAN", {"default": True}),
                 "hysteresis_threshold": ("FLOAT", {
                     "default": 0.15, "min": 0.0, "max": 0.5, "step": 0.01,
                     "tooltip": "Minimum confidence change to flip a pixel"
                 }),
                 
-                # Stage 5: Edge Refinement (BiRefNet)
                 "enable_birefnet": ("BOOLEAN", {"default": False,
                     "tooltip": "Use BiRefNet for edge refinement (requires ComfyUI-BiRefNet)"
                 }),
@@ -160,7 +145,6 @@ class SAM3MaskTemporalStabilizer:
                     "tooltip": "Optional: BiRefNet model from Load BiRefNet node"
                 }),
                 
-                # General
                 "boundary_only": ("BOOLEAN", {"default": True,
                     "tooltip": "Apply smoothing only near mask boundaries (faster)"
                 }),
@@ -177,30 +161,23 @@ class SAM3MaskTemporalStabilizer:
         self,
         masks: Dict[int, torch.Tensor],
         video_state,
-        # Stage 1
         enable_confidence_smoothing: bool = True,
         confidence_ema_alpha: float = 0.3,
-        # Stage 2
         enable_flow_warping: bool = True,
         flow_blend_alpha: float = 0.5,
         optical_flow: Optional[torch.Tensor] = None,
-        # Stage 3
         enable_distance_field: bool = True,
         sdf_smoothing_sigma: float = 1.5,
         sdf_edge_band: int = 10,
-        # Stage 4
         enable_hysteresis: bool = True,
         hysteresis_threshold: float = 0.15,
-        # Stage 5
         enable_birefnet: bool = False,
         birefnet_model = None,
-        # General
         boundary_only: bool = True,
         boundary_pixels: int = 15,
     ):
         """Apply multi-stage temporal stabilization to masks."""
         
-        # Get video properties (handles both dict and dataclass)
         images_np = _get_images_from_state(video_state)
         orig_h = _get_video_state_attr(video_state, "orig_height") or _get_video_state_attr(video_state, "height", 480)
         orig_w = _get_video_state_attr(video_state, "orig_width") or _get_video_state_attr(video_state, "width", 640)
@@ -212,8 +189,6 @@ class SAM3MaskTemporalStabilizer:
         
         # Convert dict to tensor for processing
         mask_tensor = self._dict_to_tensor(masks, sorted_keys, orig_h, orig_w)
-        
-        # Keep original for hysteresis comparison
         original_masks = mask_tensor.clone()
         
         # Stage 1: Confidence/Logit EMA Smoothing
@@ -256,20 +231,18 @@ class SAM3MaskTemporalStabilizer:
         if images_np is not None:
             debug_vis = self._create_debug_visualization(original_masks, mask_tensor, images_np, sorted_keys)
         else:
-            # Fallback: create simple visualization without source frames
             debug_vis = self._create_simple_debug_visualization(original_masks, mask_tensor, sorted_keys)
         
-        # Scores (placeholder)
         scores = {k: torch.tensor(1.0) for k in sorted_keys}
         
         print(f"[SAM3 Stabilizer] Complete!")
         return (stabilized_masks, scores, video_state, debug_vis)
 
-    def _dict_to_tensor(self, masks: Dict[int, torch.Tensor], keys: List[int], H: int, W: int) -> torch.Tensor:
-        """Convert mask dict to (N, H, W) tensor."""
+    def _dict_to_tensor(self, masks: Dict, keys: List[int], H: int, W: int) -> torch.Tensor:
+        """Convert mask dict to (N, H, W) tensor. Handles both numpy and torch."""
         out = torch.zeros(len(keys), H, W, dtype=torch.float32)
         for i, k in enumerate(keys):
-            m = masks[k].float()
+            m = _to_tensor(masks[k])  # Convert numpy or tensor to torch
             if m.dim() > 2:
                 m = m.squeeze()
             if m.shape[-2:] != (H, W):
@@ -286,16 +259,13 @@ class SAM3MaskTemporalStabilizer:
         N, H, W = masks.shape
         smoothed = masks.clone()
         
-        # Forward pass
         for t in range(1, N):
             smoothed[t] = alpha * masks[t] + (1 - alpha) * smoothed[t-1]
         
-        # Backward pass for bidirectional smoothing
         backward = masks.clone()
         for t in range(N - 2, -1, -1):
             backward[t] = alpha * masks[t] + (1 - alpha) * backward[t+1]
         
-        # Average forward and backward
         return 0.5 * (smoothed + backward)
 
     def _apply_farneback_flow(self, masks: torch.Tensor, images_np: np.ndarray, keys: List[int], blend_alpha: float) -> torch.Tensor:
@@ -323,7 +293,7 @@ class SAM3MaskTemporalStabilizer:
             
             current = masks[t].numpy()
             blended = blend_alpha * current + (1 - blend_alpha) * warped
-            stabilized[t] = torch.from_numpy(blended)
+            stabilized[t] = torch.from_numpy(blended.astype(np.float32))
         
         return stabilized
     
@@ -377,12 +347,10 @@ class SAM3MaskTemporalStabilizer:
             
         N, H, W = masks.shape
         
-        # Convert each mask to SDF
         sdf_stack = torch.zeros(N, H, W)
         for t in range(N):
             sdf_stack[t] = torch.from_numpy(self._mask_to_sdf(masks[t].numpy()))
         
-        # Temporal smoothing on SDF
         if sigma > 0:
             kernel_size = int(6 * sigma) | 1
             kernel = self._gaussian_kernel_1d(kernel_size, sigma)
@@ -459,7 +427,7 @@ class SAM3MaskTemporalStabilizer:
                 try:
                     if hasattr(birefnet_model, 'refine'):
                         refined_mask = birefnet_model.refine(image, mask)
-                        refined[t] = torch.from_numpy(refined_mask)
+                        refined[t] = torch.from_numpy(refined_mask.astype(np.float32))
                 except Exception as e:
                     print(f"[SAM3 Stabilizer] BiRefNet frame {t} failed: {e}")
             
@@ -499,10 +467,7 @@ class SAM3MaskTemporalStabilizer:
         vis = torch.zeros(N, H, W * 2, 3, dtype=torch.float32)
         
         for t in range(N):
-            # Original mask (red channel)
             vis[t, :, :W, 0] = original[t]
-            
-            # Stabilized mask (green channel)
             vis[t, :, W:, 1] = stabilized[t]
         
         return vis
@@ -539,21 +504,21 @@ class SAM3MaskTemporalMedian:
     FUNCTION = "filter"
     CATEGORY = "SAM3"
     
-    def filter(self, masks: Dict[int, torch.Tensor], video_state, window_size: int = 5, boundary_only: bool = True, boundary_pixels: int = 10):
+    def filter(self, masks: Dict, video_state, window_size: int = 5, boundary_only: bool = True, boundary_pixels: int = 10):
         sorted_keys = sorted(masks.keys())
         N = len(sorted_keys)
         
         if N == 0:
             return (masks, video_state)
         
-        first = masks[sorted_keys[0]]
+        first = _to_tensor(masks[sorted_keys[0]])
         if first.dim() > 2:
             first = first.squeeze()
         H, W = first.shape[-2:]
         
         stack = torch.zeros(N, H, W)
         for i, k in enumerate(sorted_keys):
-            m = masks[k].float()
+            m = _to_tensor(masks[k])
             if m.dim() > 2:
                 m = m.squeeze()
             if m.shape[-2:] != (H, W):
