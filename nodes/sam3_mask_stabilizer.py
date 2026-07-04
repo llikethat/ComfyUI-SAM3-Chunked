@@ -255,7 +255,7 @@ class SAM3MaskTemporalStabilizer:
         else:
             debug_vis = self._create_simple_debug_visualization(original_binary, final_masks, sorted_keys)
         
-        scores = {k: torch.tensor(1.0) for k in sorted_keys}
+        scores = None  # Let SAM3VideoOutput handle missing scores
         
         print(f"[SAM3 Stabilizer] Complete!")
         return (stabilized_masks, scores, video_state, debug_vis)
